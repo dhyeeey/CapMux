@@ -19,10 +19,12 @@ android {
 
         externalNativeBuild {
             cmake {
-                // Pass GSTREAMER_ROOT_ANDROID into CMake from local.properties or env
+                // Pass GSTREAMER_ROOT_ANDROID into CMake (env / gradle.properties / project-local SDK)
                 val gstRoot = System.getenv("GSTREAMER_ROOT_ANDROID")
                     ?: project.findProperty("gstreamer.root") as String?
-                    ?: "E:/gstreamer-android-universal"  // fallback for your machine
+                    ?: rootProject.projectDir
+                        .resolve("gstreamer-1.0-android-universal-1.28.8")
+                        .absolutePath
 
                 arguments(
                     "-DGSTREAMER_ROOT_ANDROID=$gstRoot",

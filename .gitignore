@@ -35,3 +35,9 @@ Desktop.ini
 
 # Kotlin
 .kotlin/
+
+# Local GStreamer Android SDK (large prebuilt binaries; keep outside git)
+gstreamer-1.0-android-universal-*/
+
+# Local scratch commit message (not part of the repo)
+commit-msg.txt

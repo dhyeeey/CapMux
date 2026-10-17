@@ -1,3 +1,5 @@
 <resources>
-    <string name="app_name">screencapturegstreamerandroid</string>
+    <string name="app_name">CapMux</string>
+    <string name="tap_a11y_description">Shows tap indicators while CapMux is recording the screen. Only active during a recording with Show taps enabled; touches are passed through to apps.</string>
+    <string name="tap_a11y_label">CapMux – Show taps</string>
 </resources>

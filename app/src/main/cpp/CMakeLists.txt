@@ -108,10 +108,12 @@ set(GSTREAMER_PLUGINS
         ${GSTREAMER_PLUGINS_CODECS_GPL}
 
         app
-        videoconvertscale  # Reverted back to the unified plugin name
+        videoconvertscale
         videorate
         videoparsersbad
+        audioparsers
         isomp4
+        isobmff
         x264
         androidmedia
         mpegtsmux
@@ -134,7 +136,9 @@ find_package(GStreamerMobile
 )
 
 add_library(${CMAKE_PROJECT_NAME} SHARED
-        screen_capture.cpp
+        pipeline_builder.cpp
+        media_recorder.cpp
+        jni_bridge.cpp
 )
 
 target_link_libraries(${CMAKE_PROJECT_NAME}
