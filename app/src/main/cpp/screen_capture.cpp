@@ -1,296 +1,441 @@
 #include <android/log.h>
-#include <jni.h>
-#include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include <gst/gst.h>
+#include <jni.h>
 
-#include <string>
-#include <memory>
-#include <thread>
 #include <atomic>
+#include <memory>
 #include <stdexcept>
+#include <string>
+#include <cstring>
 
 #define TAG "ScreenCapNative"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, TAG, __VA_ARGS__)
 
-// -------------------------------------------------------------------------
-// Strict Deleters for Smart Pointers (RAII for GStreamer/GLib)
-// -------------------------------------------------------------------------
-
-template <typename T>
+template<typename T>
 struct GstObjectDeleter {
-    void operator()(T* p) const { if (p) gst_object_unref(p); }
+    void operator()(T* p) const {
+        if (p) {
+            gst_object_unref(p);
+        }
+    }
 };
-template <typename T>
+
+template<typename T>
 using GstObjPtr = std::unique_ptr<T, GstObjectDeleter<T>>;
 
 struct GstCapsDeleter {
-    void operator()(GstCaps* p) const { if (p) gst_caps_unref(p); }
+    void operator()(GstCaps* p) const {
+        if (p) {
+            gst_caps_unref(p);
+        }
+    }
 };
+
 using GstCapsPtr = std::unique_ptr<GstCaps, GstCapsDeleter>;
 
-struct GSourceDeleter {
-    void operator()(GSource* p) const { if (p) g_source_unref(p); }
-};
-using GSourcePtr = std::unique_ptr<GSource, GSourceDeleter>;
-
-struct GErrorDeleter {
-    void operator()(GError* p) const { if (p) g_error_free(p); }
-};
-using GErrorPtr = std::unique_ptr<GError, GErrorDeleter>;
-
-struct GMainLoopDeleter {
-    void operator()(GMainLoop* p) const { if (p) g_main_loop_unref(p); }
-};
-using GMainLoopPtr = std::unique_ptr<GMainLoop, GMainLoopDeleter>;
-
-struct GMainContextDeleter {
-    void operator()(GMainContext* p) const { if (p) g_main_context_unref(p); }
-};
-using GMainContextPtr = std::unique_ptr<GMainContext, GMainContextDeleter>;
-
-
-// -------------------------------------------------------------------------
-// OOP Wrapper for the GStreamer Pipeline
-// -------------------------------------------------------------------------
 class ScreenRecorder {
 public:
-    ScreenRecorder(int w, int h, int fps, int fd, int bitrate, const std::string& parserStr)
-            : m_fd(fd)
-    {
-        LOGI("Init: Zero-Copy MediaCodec Pipeline -> fd=%d, parser=%s", fd, parserStr.c_str());
+    ScreenRecorder(
+            int width,
+            int height,
+            int fps,
+            int fd,
+            const std::string& parser
+    )
+            : m_fps(fps),
+              m_fd(fd) {
 
-        // Use a leaky downstream queue (drops oldest buffers) to prevent latency buildup
-        char pipelineStr[2048];
-        snprintf(pipelineStr, sizeof(pipelineStr),
-                "appsrc name=mysrc format=time is-live=true block=false do-timestamp=false ! "
-                "%s ! "
-                "queue max-size-buffers=60 max-size-bytes=0 max-size-time=0 leaky=downstream ! "
-                "mpegtsmux ! "
-                "fdsink fd=%d",
-                parserStr.c_str(), m_fd);
+        gst_init(nullptr, nullptr);
 
-        LOGI("Pipeline Launch String:\n%s", pipelineStr);
+        std::string parserString = parser;
+
+        if (parser == "h264parse" ||
+                parser == "h265parse") {
+
+            parserString +=
+                    " config-interval=-1 ";
+        }
+
+        char pipeline[4096];
+
+        snprintf(
+                pipeline,
+                sizeof(pipeline),
+
+                "appsrc name=mysrc "
+                "is-live=true "
+                "format=time "
+                "block=false "
+                "do-timestamp=false "
+
+                "! %s "
+
+                "! queue "
+                "max-size-buffers=60 "
+                "max-size-bytes=0 "
+                "max-size-time=0 "
+                "leaky=downstream "
+
+                "! isofmp4mux "
+                "fragment-duration=1000000000 "
+                "chunk-mode=keyframe "
+                "header-update-mode=rewrite "
+                "send-force-keyunit=true "
+                "write-mfra=true "
+                "offset-to-zero=true "
+
+                "! fdsink fd=%d",
+
+                parserString.c_str(),
+                m_fd
+        );
+
+        LOGI("Pipeline:\n%s", pipeline);
 
         GError* err = nullptr;
-        m_pipeline.reset(gst_parse_launch(pipelineStr, &err));
 
-        if (err || !m_pipeline) {
-            std::string errMsg = err ? err->message : "Unknown error";
-            LOGE("gst_parse_launch failed: %s", errMsg.c_str());
-            if (err) g_error_free(err);
-            throw std::runtime_error("Failed to parse GStreamer pipeline: " + errMsg);
+        m_pipeline.reset(
+                gst_parse_launch(pipeline, &err));
+
+        if (!m_pipeline || err) {
+            std::string msg =
+                    err ? err->message : "unknown";
+
+            if (err) {
+                g_error_free(err);
+            }
+
+            throw std::runtime_error(msg);
         }
 
-        m_appSrc.reset(GST_APP_SRC(gst_bin_get_by_name(GST_BIN(m_pipeline.get()), "mysrc")));
+        m_appSrc.reset(
+                GST_APP_SRC(
+                        gst_bin_get_by_name(
+                                GST_BIN(m_pipeline.get()),
+                                "mysrc")));
+
         if (!m_appSrc) {
-            throw std::runtime_error("Could not find 'mysrc' element in pipeline");
+            throw std::runtime_error(
+                    "Failed to get appsrc");
         }
 
-        // Determine caps based on parser
-        std::string capsStr = "video/x-h264, stream-format=byte-stream, alignment=au";
-        if (parserStr == "h265parse") {
-            capsStr = "video/x-h265, stream-format=byte-stream, alignment=au";
-        } else if (parserStr == "av1parse") {
-            capsStr = "video/x-av1, stream-format=byte-stream, alignment=au";
-        }
+        GstCapsPtr caps(
+                gst_caps_from_string(
+                        "video/x-h264,"
+                        "alignment=au"));
 
-        GstCapsPtr srcCaps(gst_caps_from_string(capsStr.c_str()));
-        g_object_set(m_appSrc.get(), "caps", srcCaps.get(), nullptr);
+        g_object_set(
+                m_appSrc.get(),
+                "caps",
+                caps.get(),
+                nullptr);
 
-        m_context.reset(g_main_context_new());
-        m_loop.reset(g_main_loop_new(m_context.get(), FALSE));
+        GstBus* bus =
+                gst_element_get_bus(m_pipeline.get());
 
-        GstObjPtr<GstBus> bus(gst_element_get_bus(m_pipeline.get()));
-        GSourcePtr watch(gst_bus_create_watch(bus.get()));
-        g_source_set_callback(watch.get(), (GSourceFunc)onBusMessage, this, nullptr);
-        g_source_attach(watch.get(), m_context.get());
+        gst_bus_add_watch(
+                bus,
 
-        m_loopThread = std::thread([this]() {
-            LOGI("GLib main loop starting...");
-            g_main_loop_run(m_loop.get());
-            LOGI("GLib main loop exited.");
-        });
+                [](GstBus*,
+                        GstMessage* msg,
+                        gpointer) -> gboolean {
+
+                    switch (GST_MESSAGE_TYPE(msg)) {
+
+                        case GST_MESSAGE_ERROR: {
+                            GError* err = nullptr;
+                            gchar* dbg = nullptr;
+
+                            gst_message_parse_error(
+                                    msg,
+                                    &err,
+                                    &dbg);
+
+                            LOGE("GST ERROR: %s",
+                                    err->message);
+
+                            if (dbg) {
+                                LOGE("DEBUG: %s", dbg);
+                            }
+
+                            g_error_free(err);
+                            g_free(dbg);
+
+                            break;
+                        }
+
+                        case GST_MESSAGE_EOS:
+                            LOGI("GST EOS");
+                            break;
+
+                        default:
+                            break;
+                    }
+
+                    return TRUE;
+                },
+
+                nullptr);
+
+        gst_object_unref(bus);
     }
 
     ~ScreenRecorder() {
-        LOGI("Destroying ScreenRecorder...");
-
-        if (m_loop) {
-            g_main_loop_quit(m_loop.get());
-        }
-
-        if (m_loopThread.joinable()) {
-            m_loopThread.join();
-        }
-
         if (m_pipeline) {
-            gst_element_set_state(m_pipeline.get(), GST_STATE_NULL);
+            gst_element_set_state(
+                    m_pipeline.get(),
+                    GST_STATE_NULL);
         }
-
-        LOGI("ScreenRecorder fully destroyed.");
     }
 
     bool start() {
-        LOGI("Setting pipeline to PLAYING...");
-        GstStateChangeReturn ret = gst_element_set_state(m_pipeline.get(), GST_STATE_PLAYING);
+
+        GstStateChangeReturn ret =
+                gst_element_set_state(
+                        m_pipeline.get(),
+                        GST_STATE_PLAYING);
+
         if (ret == GST_STATE_CHANGE_FAILURE) {
-            LOGE("Failed to set pipeline to PLAYING state.");
+            LOGE("Failed PLAYING state");
             return false;
         }
+
+        LOGI("Pipeline started");
+
         return true;
     }
 
     void stop() {
-        if (!m_isEos.exchange(true)) {
-            LOGI("Sending EOS to appsrc (Frames recorded: %llu)", (unsigned long long)m_framesIn.load());
-            if (m_appSrc) {
-                gst_app_src_end_of_stream(m_appSrc.get());
-            }
+
+        if (!m_eos.exchange(true)) {
+
+            LOGI("Sending EOS");
+
+            gst_app_src_end_of_stream(
+                    m_appSrc.get());
+
+            gst_element_get_state(
+                    m_pipeline.get(),
+                    nullptr,
+                    nullptr,
+                    5 * GST_SECOND);
         }
     }
 
-    void pushEncodedFrame(const uint8_t* data, size_t size, uint64_t tsUs, uint32_t flags) {
-        if (m_isEos || !m_appSrc) return;
+    void pushEncodedFrame(
+            const uint8_t* data,
+            size_t size,
+            uint64_t tsUs,
+            uint32_t flags) {
 
-        uint64_t tsNs = tsUs * 1000;
-
-        if (m_firstTsNs == 0) {
-            m_firstTsNs = tsNs;
+        if (m_eos) {
+            return;
         }
 
-        uint64_t pts = (tsNs >= m_firstTsNs) ? (tsNs - m_firstTsNs) : 0;
+        uint64_t tsNs =
+                tsUs * 1000ULL;
 
-        GstBuffer* gb = gst_buffer_new_allocate(nullptr, size, nullptr);
+        if (m_firstPts == GST_CLOCK_TIME_NONE) {
+            m_firstPts = tsNs;
+        }
+
+        GstClockTime pts =
+                tsNs - m_firstPts;
+
+        GstBuffer* buffer =
+                gst_buffer_new_allocate(
+                        nullptr,
+                        size,
+                        nullptr);
+
         GstMapInfo map;
-        gst_buffer_map(gb, &map, GST_MAP_WRITE);
-        memcpy(map.data, data, size);
-        gst_buffer_unmap(gb, &map);
 
-        GST_BUFFER_PTS(gb) = pts;
+        gst_buffer_map(
+                buffer,
+                &map,
+                GST_MAP_WRITE);
 
-        if (flags & 2) { // BUFFER_FLAG_CODEC_CONFIG = 2
-            GST_BUFFER_PTS(gb) = GST_CLOCK_TIME_NONE;
+        memcpy(map.data,data,size);
+
+        gst_buffer_unmap(buffer,&map);
+
+        GST_BUFFER_PTS(buffer) = pts;
+        GST_BUFFER_DTS(buffer) = pts;
+
+        GST_BUFFER_DURATION(buffer) =
+                gst_util_uint64_scale_int(
+                        1,
+                        GST_SECOND,
+                        m_fps);
+
+        // codec config
+        if (flags & 2) {
+            GST_BUFFER_FLAG_SET(
+                    buffer,
+                    GST_BUFFER_FLAG_HEADER);
         }
 
-        GstFlowReturn ret = gst_app_src_push_buffer(m_appSrc.get(), gb);
-        if (ret != GST_FLOW_OK) {
-            LOGW("appsrc buffer drop, reason: %s", gst_flow_get_name(ret));
+        // keyframe handling
+        if (flags & 1) {
+            GST_BUFFER_FLAG_UNSET(buffer,GST_BUFFER_FLAG_DELTA_UNIT);
         } else {
-            m_framesIn++;
+            GST_BUFFER_FLAG_SET(buffer,GST_BUFFER_FLAG_DELTA_UNIT);
+        }
+
+//        LOGI(
+//                "push frame size=%zu pts=%llu flags=%u",
+//                size,
+//                (unsigned long long) pts,
+//                flags);
+
+        GstFlowReturn ret =
+                gst_app_src_push_buffer(
+                        m_appSrc.get(),
+                        buffer);
+
+        if (ret != GST_FLOW_OK) {
+            LOGW("push failed: %s",
+                    gst_flow_get_name(ret));
         }
     }
 
 private:
+    int m_fps;
     int m_fd;
-    uint64_t m_firstTsNs = 0;
 
-    std::atomic<bool> m_isEos{false};
-    std::atomic<uint64_t> m_framesIn{0};
+    GstClockTime m_firstPts =
+            GST_CLOCK_TIME_NONE;
 
+    std::atomic<bool> m_eos{false};
     GstObjPtr<GstElement> m_pipeline;
-    GstObjPtr<GstAppSrc>  m_appSrc;
-    GMainContextPtr       m_context;
-    GMainLoopPtr          m_loop;
-    std::thread           m_loopThread;
-
-    static gboolean onBusMessage(GstBus* bus, GstMessage* msg, gpointer data) {
-        return static_cast<ScreenRecorder*>(data)->handleMessage(msg);
-    }
-
-    gboolean handleMessage(GstMessage* msg) {
-        switch (GST_MESSAGE_TYPE(msg)) {
-            case GST_MESSAGE_EOS:
-                LOGI("Bus: EOS received. MPEG-TS generation complete.");
-                g_main_loop_quit(m_loop.get());
-                break;
-
-            case GST_MESSAGE_ERROR: {
-                GError* e = nullptr; gchar* d = nullptr;
-                gst_message_parse_error(msg, &e, &d);
-                LOGE("Bus ERROR from '%s': %s", GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)), e->message);
-                if (d) LOGE("Debug info: %s", d);
-                g_error_free(e); g_free(d);
-                g_main_loop_quit(m_loop.get());
-                break;
-            }
-
-            case GST_MESSAGE_WARNING: {
-                GError* e = nullptr; gchar* d = nullptr;
-                gst_message_parse_warning(msg, &e, &d);
-                LOGW("Bus WARNING from '%s': %s", GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)), e->message);
-                g_error_free(e); g_free(d);
-                break;
-            }
-            default:
-                break;
-        }
-        return TRUE;
-    }
+    GstObjPtr<GstAppSrc> m_appSrc;
 };
 
-
-// -------------------------------------------------------------------------
-// JNI Entry Points
-// -------------------------------------------------------------------------
-
-extern "C" JNIEXPORT jlong JNICALL
+extern "C"
+JNIEXPORT jlong JNICALL
 Java_com_dhyey_screencapturegstreamerandroid_CaptureService_nativeCreate(
-        JNIEnv* env, jobject /*thiz*/,
-        jint w, jint h, jint fps, jint out_fd, jint bitrate_bps, jstring gst_parser) {
+        JNIEnv* env,
+        jobject,
+        jint width,
+        jint height,
+        jint fps,
+        jint fd,
+        jint bitrate,
+        jstring parserStr) {
 
-    const char* parserStr = env->GetStringUTFChars(gst_parser, nullptr);
-    std::string parser(parserStr);
-    env->ReleaseStringUTFChars(gst_parser, parserStr);
+    const char* chars =
+            env->GetStringUTFChars(
+                    parserStr,
+                    nullptr);
+
+    std::string parser(chars);
+
+    env->ReleaseStringUTFChars(
+            parserStr,
+            chars);
 
     try {
-        auto* rec = new ScreenRecorder(w, h, fps, out_fd, bitrate_bps, parser);
+
+        auto* rec =
+                new ScreenRecorder(
+                        width,
+                        height,
+                        fps,
+                        fd,
+                        parser);
+
         return reinterpret_cast<jlong>(rec);
+
     } catch (const std::exception& e) {
-        LOGE("Failed to create pipeline: %s", e.what());
+
+        LOGE("nativeCreate failed: %s",
+                e.what());
+
         return 0;
     }
 }
 
-extern "C" JNIEXPORT void JNICALL
+extern "C"
+JNIEXPORT void JNICALL
 Java_com_dhyey_screencapturegstreamerandroid_CaptureService_nativeStart(
-        JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
-    if (handle) {
-        reinterpret_cast<ScreenRecorder*>(handle)->start();
+        JNIEnv*,
+        jobject,
+        jlong handle) {
+
+    if (!handle) {
+        return;
     }
+
+    reinterpret_cast<ScreenRecorder*>(handle)
+            ->start();
 }
 
-extern "C" JNIEXPORT void JNICALL
+extern "C"
+JNIEXPORT void JNICALL
 Java_com_dhyey_screencapturegstreamerandroid_CaptureService_nativePushEncodedFrame(
-        JNIEnv* env, jobject /*thiz*/,
-        jlong handle, jobject buf, jint size, jlong ts_us, jint flags) {
+        JNIEnv* env,
+        jobject,
+        jlong handle,
+        jobject buf,
+        jint size,
+        jlong tsUs,
+        jint flags) {
 
-    if (!handle) return;
-
-    uint8_t* px = static_cast<uint8_t*>(env->GetDirectBufferAddress(buf));
-    if (px) {
-        reinterpret_cast<ScreenRecorder*>(handle)->pushEncodedFrame(px, size, ts_us, flags);
+    if (!handle) {
+        return;
     }
+
+    auto* ptr =
+            static_cast<uint8_t*>(
+                    env->GetDirectBufferAddress(buf));
+
+    if (!ptr) {
+        return;
+    }
+
+    reinterpret_cast<ScreenRecorder*>(handle)
+            ->pushEncodedFrame(
+                    ptr,
+                    size,
+                    tsUs,
+                    flags);
 }
 
-extern "C" JNIEXPORT void JNICALL
+extern "C"
+JNIEXPORT void JNICALL
 Java_com_dhyey_screencapturegstreamerandroid_CaptureService_nativeStop(
-        JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
-    if (handle) {
-        reinterpret_cast<ScreenRecorder*>(handle)->stop();
+        JNIEnv*,
+        jobject,
+        jlong handle) {
+
+    if (!handle) {
+        return;
     }
+
+    reinterpret_cast<ScreenRecorder*>(handle)
+            ->stop();
 }
 
-extern "C" JNIEXPORT void JNICALL
+extern "C"
+JNIEXPORT void JNICALL
 Java_com_dhyey_screencapturegstreamerandroid_CaptureService_nativeDestroy(
-        JNIEnv* /*env*/, jobject /*thiz*/, jlong handle) {
-    if (handle) {
-        delete reinterpret_cast<ScreenRecorder*>(handle);
+        JNIEnv*,
+        jobject,
+        jlong handle) {
+
+    if (!handle) {
+        return;
     }
+
+    delete reinterpret_cast<ScreenRecorder*>(handle);
 }
 
-JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* /*reserved*/) {
-    LOGI("Native Library Loaded.");
+JNIEXPORT jint JNICALL
+JNI_OnLoad(JavaVM*, void*) {
+    setenv("GST_DEBUG","2,isofmp4mux:6,h264parse:6,h265parse:6",1);
     return JNI_VERSION_1_6;
 }
