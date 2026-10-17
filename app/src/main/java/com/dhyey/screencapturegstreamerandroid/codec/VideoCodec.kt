@@ -10,12 +10,15 @@ enum class VideoCodec(val mime: String, val gstParser: String) {
     HEVC(MediaFormat.MIMETYPE_VIDEO_HEVC, "h265parse"),
     AV1(MediaFormat.MIMETYPE_VIDEO_AV1, "av1parse"); // Experimental, requires modern GStreamer
 
-    // HEVC provides roughly 40% better compression than AVC, AV1 ~50%
+    /**
+     * Screen UI (sharp icons/text) benefits less from HEVC efficiency than camera
+     * video. A large discount makes QTI HEVC start muddy for a few seconds under VBR.
+     */
     val bitrateMultiplier: Double
         get() = when (this) {
             AVC -> 1.0
-            HEVC -> 0.6
-            AV1 -> 0.5
+            HEVC -> 0.9
+            AV1 -> 0.75
         }
 }
 
@@ -35,26 +38,32 @@ object CodecManager {
      */
     fun findHardwareEncoder(mimeType: String): MediaCodecInfo? {
         val codecList = MediaCodecList(MediaCodecList.ALL_CODECS)
-        for (info in codecList.codecInfos) {
-            if (!info.isEncoder) continue
-            
-            // We ONLY want hardware-accelerated encoders to prevent CPU bottleneck
-            val isHardware = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                info.isHardwareAccelerated
-            } else {
-                // Fallback heuristic for older Android versions
-                val name = info.name.lowercase()
-                !name.startsWith("omx.google.") && !name.contains("sw") && !name.contains("software")
-            }
-
-            if (!isHardware) continue
-
-            if (info.supportedTypes.contains(mimeType)) {
-                Log.i(TAG, "Found hardware encoder for $mimeType: ${info.name}")
-                return info
-            }
+        val candidates = codecList.codecInfos.filter { info ->
+            if (!info.isEncoder) return@filter false
+            if (!info.supportedTypes.contains(mimeType)) return@filter false
+            isHardwareEncoder(info)
         }
-        return null
+
+        // Prefer Codec2 hardware encoders when present; works across QTI / Exynos / MTK / Tensor.
+        val preferred = candidates.firstOrNull { it.name.lowercase().startsWith("c2.") }
+            ?: candidates.firstOrNull()
+
+        if (preferred != null) {
+            Log.i(TAG, "Found hardware encoder for $mimeType: ${preferred.name}")
+        }
+        return preferred
+    }
+
+    private fun isHardwareEncoder(info: MediaCodecInfo): Boolean {
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            return info.isHardwareAccelerated
+        }
+        val name = info.name.lowercase()
+        // Exclude known software encoder namespaces across vendors.
+        return !name.startsWith("omx.google.") &&
+            !name.startsWith("c2.android.") &&
+            !name.contains("sw") &&
+            !name.contains("software")
     }
 
     /**
@@ -94,18 +103,24 @@ object CodecManager {
         val pixelsPerSecond = w.toLong() * h * fps
         
         // Base bits per pixel
+        // Slightly conservative bpp keeps GPU/encoder cooler during screen share.
         val baseBpp = when (profile) {
-            RecordingProfile.COMPATIBILITY -> 0.10
-            RecordingProfile.LOW_LATENCY -> 0.12
-            RecordingProfile.BALANCED -> 0.15
-            RecordingProfile.HIGH_QUALITY -> 0.25
-            RecordingProfile.VISUALLY_LOSSLESS -> 0.40
+            RecordingProfile.COMPATIBILITY -> 0.08
+            RecordingProfile.LOW_LATENCY -> 0.10
+            RecordingProfile.BALANCED -> 0.12
+            RecordingProfile.HIGH_QUALITY -> 0.20
+            RecordingProfile.VISUALLY_LOSSLESS -> 0.35
         }
 
         // Apply codec efficiency scaling
         val rawBitrate = (pixelsPerSecond * baseBpp * codec.bitrateMultiplier).toInt()
 
-        // Clamp to sane limits (2 Mbps to 100 Mbps)
-        return rawBitrate.coerceIn(2_000_000, 100_000_000)
+        // Floor scales with resolution so HEVC never opens at a tiny 2 Mbps on 1080p+.
+        val minBitrate = when {
+            pixelsPerSecond >= 1080L * 2400 * 30 -> 6_000_000
+            pixelsPerSecond >= 720L * 1280 * 30 -> 4_000_000
+            else -> 2_500_000
+        }
+        return rawBitrate.coerceIn(minBitrate, 100_000_000)
     }
 }
